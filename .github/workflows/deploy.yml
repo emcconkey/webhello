@@ -1,0 +1,39 @@
+name: Deploy to EC2
+
+on:
+  workflow_run:
+    workflows: ["Build and Push Docker Image"]
+    types:
+      - completed
+  workflow_dispatch:
+
+env:
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Deploy to App Servers via Jumpbox
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.APP_SERVER_HOSTS }} # Comma separated list of private IPs
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          proxy_host: ${{ secrets.JUMPBOX_HOST }}
+          proxy_username: ${{ secrets.SSH_USERNAME }}
+          proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Log in to Docker Hub
+            echo ${{ secrets.DOCKERHUB_TOKEN }} | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+            
+            # Pull the latest image
+            docker pull ${{ env.DOCKERHUB_REPO }}:main
+            
+            # Stop and remove existing container if it exists
+            docker stop webhello || true
+            docker rm webhello || true
+            
+            # Run the new container
+            docker run -d --name webhello -p 80:80 ${{ env.DOCKERHUB_REPO }}:main
