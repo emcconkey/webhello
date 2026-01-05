@@ -36,4 +36,4 @@ jobs:
             docker rm webhello || true
             
             # Run the new container
-            docker run -d --name webhello -p 80:80 ${{ env.DOCKERHUB_REPO }}:main
+            docker run -d --name webhello -p 8003:80 ${{ env.DOCKERHUB_REPO }}:main
