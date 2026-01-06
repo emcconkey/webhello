@@ -6,6 +6,19 @@ on:
     types:
       - completed
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'qa'
+        type: choice
+        options:
+          - qa
+          - prod
+      docker_tag:
+        description: 'Docker image tag to deploy'
+        required: true
+        default: 'main'
 
 env:
   DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
@@ -14,26 +27,67 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    environment: >-
+      ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 
+          (startsWith(github.event.workflow_run.head_branch, 'release/') && 'prod' || 'qa') }}
     steps:
-      - name: Deploy to App Servers via Jumpbox
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set deployment variables
+        id: vars
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            DEPLOY_ENV=${{ github.event.inputs.environment }}
+            DOCKER_TAG=${{ github.event.inputs.docker_tag }}
+          else
+            # Triggered by workflow_run
+            BRANCH="${{ github.event.workflow_run.head_branch }}"
+            if [[ "$BRANCH" == release/* ]]; then
+              DEPLOY_ENV=prod
+            else
+              DEPLOY_ENV=qa
+            fi
+            # Use the branch name as the tag (matches build.yml logic)
+            DOCKER_TAG=$(echo $BRANCH | sed 's/\//-/g')
+            
+            # Special case for main branch which might be tagged 'main' or 'latest'
+            # In build.yml, 'main' branch results in 'main' and 'latest' tags.
+            if [[ "$BRANCH" == "main" ]]; then
+              DOCKER_TAG="main"
+            fi
+          fi
+          echo "deploy_env=$DEPLOY_ENV" >> $GITHUB_OUTPUT
+          echo "docker_tag=$DOCKER_TAG" >> $GITHUB_OUTPUT
+
+      - name: Copy deployment script via Jumpbox
+        uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.APP_SERVER_HOSTS }} # Comma separated list of private IPs
+          host: ${{ secrets.APP_SERVER_HOSTS }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           proxy_host: ${{ secrets.JUMPBOX_HOST }}
           proxy_username: ${{ secrets.SSH_USERNAME }}
           proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "scripts/deploy.sh"
+          target: "~/"
+
+      - name: Execute deployment script via Jumpbox
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.APP_SERVER_HOSTS }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          proxy_host: ${{ secrets.JUMPBOX_HOST }}
+          proxy_username: ${{ secrets.SSH_USERNAME }}
+          proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DOCKERHUB_REPO,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,AWS_REGION,DEPLOY_ENV,DOCKER_TAG
           script: |
-            # Log in to Docker Hub
-            echo ${{ secrets.DOCKERHUB_TOKEN }} | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
-            
-            # Pull the latest image
-            docker pull ${{ env.DOCKERHUB_REPO }}:main
-            
-            # Stop and remove existing container if it exists
-            docker stop webhello || true
-            docker rm webhello || true
-            
-            # Run the new container
-            docker run -d --name webhello -p 8003:80 ${{ env.DOCKERHUB_REPO }}:main
+            export DOCKERHUB_REPO=${{ env.DOCKERHUB_REPO }}
+            export DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
+            export DOCKERHUB_TOKEN=${{ secrets.DOCKERHUB_TOKEN }}
+            export AWS_REGION=${{ secrets.AWS_REGION }}
+            export DEPLOY_ENV=${{ steps.vars.outputs.deploy_env }}
+            export DOCKER_TAG=${{ steps.vars.outputs.docker_tag }}
+            chmod +x ~/deploy.sh
+            ~/deploy.sh
